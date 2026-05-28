@@ -20,15 +20,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Quant Stack
+      - name: Install Pinned Quant Stack
         run: |
           pip install --upgrade pip
+          # Institutional Stability: Version Pinning
           pip install pandas==2.1.4 pandas-datareader==0.10.0 numpy==1.26.4
-          pip install yfinance numerapi lxml beautifulsoup4
+          pip install yfinance numerapi lxml beautifulsoup4 requests
 
       - name: Execute Macro-Systemic Engine
         env:
           NUMERAI_PUBLIC_KEY: ${{ secrets.NUMERAI_PUBLIC_KEY }}
           NUMERAI_SECRET_KEY: ${{ secrets.NUMERAI_SECRET_KEY }}
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python signals_script.py

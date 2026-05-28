@@ -1,0 +1,32 @@
+name: Daily_Signals_Automation
+
+on:
+  schedule:
+    - cron: '0 19 * * *' # Runs Daily at 19:00 UTC (10:00 PM Ethiopia)
+  workflow_dispatch: 
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  run_signals:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Quant Stack
+        run: |
+          pip install --upgrade pip
+          pip install numerapi pandas numpy yfinance pandas_datareader
+
+      - name: Execute Macro-Systemic Engine
+        env:
+          NUMERAI_PUBLIC_KEY: ${{ secrets.NUMERAI_PUBLIC_KEY }}
+          NUMERAI_SECRET_KEY: ${{ secrets.NUMERAI_SECRET_KEY }}
+        run: python signals_script.py

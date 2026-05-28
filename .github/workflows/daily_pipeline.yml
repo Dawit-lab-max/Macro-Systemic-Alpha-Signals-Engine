@@ -2,9 +2,11 @@ name: Daily_Signals_Automation
 
 on:
   schedule:
+    # Redundant triggers at 19:00 UTC (10:00 PM Ethiopia)
     - cron: '0 19 * * *' 
-  workflow_dispatch: 
+  workflow_dispatch: # Allows manual trigger
 
+# Institutional Log Hygiene
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
@@ -12,7 +14,7 @@ jobs:
   run_signals:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Python 3.11
@@ -23,7 +25,7 @@ jobs:
       - name: Install Pinned Quant Stack
         run: |
           pip install --upgrade pip
-          # Pinned versions to fix the 'deprecate_kwarg' bug
+          # Fixing the 'deprecate_kwarg' bug via version pinning
           pip install pandas==2.1.4 pandas-datareader==0.10.0
           pip install numpy yfinance numerapi lxml beautifulsoup4
 

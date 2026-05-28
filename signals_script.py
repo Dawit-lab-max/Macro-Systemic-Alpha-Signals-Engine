@@ -6,7 +6,7 @@ Description: Low-memory, crash-resistant production pipeline using Polars.
              Dynamically retrieves the official universe via live.parquet,
              handles ticker mapping via pure-Python rules (no S3 file dependencies),
              and applies mean reversion and FRED macro risk shields.
-             Includes explicit index normalization to handle yfinance v1.4.0+ regressions.
+             Includes ISO country code alignment and pre-flight SD validation.
 """
 import os
 import sys
@@ -74,54 +74,54 @@ def fetch_official_universe(sapi: numerapi.SignalsAPI) -> tuple[list[str], str]:
 class TickerConverter:
     """
     Pure-Python Rule-Based Ticker Converter.
-    Eliminates dependencies on external S3 CSV mapping databases.
-    Maps Bloomberg/Numerai formats (e.g., 'AAPL US', '7203 JP') to Yahoo, and vice-versa.
+    Maps tickers to/from Yahoo Finance using ISO two-letter country execution codes
+    for 'numerai_ticker' compatibility, and legacy Bloomberg suffixes otherwise.
     """
     def __init__(self):
-        # Forward maps (Exchange country code -> Yahoo suffix)
-        self.exchange_to_yahoo_suffix = {
+        # Forward maps (Numerai ISO country code -> Yahoo suffix)
+        self.iso_to_yahoo_suffix = {
             "US": "",
             "JP": ".T",
             "KR": ".KS",
-            "LN": ".L",
-            "CN": ".TO",
+            "GB": ".L",
+            "CA": ".TO",
             "AU": ".AX",
-            "FP": ".PA",
-            "GY": ".DE",
+            "FR": ".PA",
+            "DE": ".DE",
             "HK": ".HK",
-            "SS": ".SS",
-            "SZ": ".SZ",
+            "CN": ".SS",
             "ID": ".JK",
-            "IM": ".MI",
-            "NA": ".AS",
-            "SP": ".MC",
-            "SW": ".SW",
-            "TA": ".TA",
+            "IT": ".MI",
+            "NL": ".AS",
+            "ES": ".MC",
+            "CH": ".SW",
+            "IL": ".TA",
             "IN": ".NS",
             "BR": ".SA",
             "MX": ".MX",
-            "CH": ".SW",
             "PL": ".WA",
             "ZA": ".JO",
         }
-        # Inverse maps (Yahoo suffix -> Exchange country code)
-        self.yahoo_suffix_to_exchange = {
+        # Inverse maps (Yahoo suffix -> Numerai ISO country code)
+        self.yahoo_suffix_to_iso = {
+            "": "US",
             "T": "JP",
             "KS": "KR",
-            "L": "LN",
-            "TO": "CN",
+            "L": "GB",
+            "TO": "CA",
+            "V": "CA",
             "AX": "AU",
-            "PA": "FP",
-            "DE": "GY",
+            "PA": "FR",
+            "DE": "DE",
             "HK": "HK",
-            "SS": "SS",
-            "SZ": "SZ",
+            "SS": "CN",
+            "SZ": "CN",
             "JK": "ID",
-            "MI": "IM",
-            "AS": "NA",
-            "MC": "SP",
-            "SW": "SW",
-            "TA": "TA",
+            "MI": "IT",
+            "AS": "NL",
+            "MC": "ES",
+            "SW": "CH",
+            "TA": "IL",
             "NS": "IN",
             "SA": "BR",
             "MX": "MX",
@@ -138,11 +138,17 @@ class TickerConverter:
             ticker, exchange = parts[0], parts[1].upper()
             ticker = ticker.replace("/", "-")
             
-            if exchange in self.exchange_to_yahoo_suffix:
-                suffix = self.exchange_to_yahoo_suffix[exchange]
+            # Map using ISO or standard fallback exchange rule
+            if exchange in self.iso_to_yahoo_suffix:
+                suffix = self.iso_to_yahoo_suffix[exchange]
                 return f"{ticker}{suffix}"
             else:
-                return f"{ticker}.{exchange.lower()}"
+                # Fallback exchange codes (e.g., Bloomberg legacy mapping)
+                fallback_map = {
+                    "LN": ".L", "CN": ".TO", "FP": ".PA", "GY": ".DE"
+                }
+                suffix = fallback_map.get(exchange, f".{exchange.lower()}")
+                return f"{ticker}{suffix}"
         return src_clean
 
     def to_target(self, yahoo_ticker: str, target_col: str) -> str:
@@ -154,13 +160,28 @@ class TickerConverter:
             ticker = ticker.replace("-", "/")
             suffix_upper = suffix.upper()
             
-            if suffix in self.yahoo_suffix_to_exchange:
-                exchange = self.yahoo_suffix_to_exchange[suffix]
-            elif suffix_upper in self.yahoo_suffix_to_exchange:
-                exchange = self.yahoo_suffix_to_exchange[suffix_upper]
+            # 1. Output Numerai-compliant ISO format if target column is numerai_ticker
+            if target_col in ["numerai_ticker", "ticker"]:
+                if suffix in self.yahoo_suffix_to_iso:
+                    country = self.yahoo_suffix_to_iso[suffix]
+                elif suffix_upper in self.yahoo_suffix_to_iso:
+                    country = self.yahoo_suffix_to_iso[suffix_upper]
+                else:
+                    country = suffix_upper
+                return f"{ticker} {country}"
+            
+            # 2. Output legacy Bloomberg formats otherwise
             else:
-                exchange = suffix_upper
-            return f"{ticker} {exchange}"
+                bbg_exchange_map = {
+                    "L": "LN", "TO": "CN", "V": "CN", "PA": "FP", "DE": "GY", "SW": "SW"
+                }
+                if suffix in bbg_exchange_map:
+                    exchange = bbg_exchange_map[suffix]
+                elif suffix_upper in bbg_exchange_map:
+                    exchange = bbg_exchange_map[suffix_upper]
+                else:
+                    exchange = self.yahoo_suffix_to_iso.get(suffix, suffix_upper)
+                return f"{ticker} {exchange}"
         else:
             ticker = yahoo_clean.replace("-", "/")
             return f"{ticker} US"
@@ -211,30 +232,52 @@ def download_historical_prices(yahoo_tickers: list, period: str = "60d") -> pl.D
             if chunk_data.empty:
                 continue
                 
-            # Parse metrics depending on MultiIndex vs Flat columns
+            # Assign index name to "Date" before processing structure
+            chunk_data.index.name = "Date"
+            
+            # 1. Handle MultiIndex Column Structures (dynamic level inspection)
             if isinstance(chunk_data.columns, pd.MultiIndex):
-                if "Adj Close" in chunk_data.columns.levels[0]:
-                    adj_close = chunk_data["Adj Close"].copy()
-                elif "Close" in chunk_data.columns.levels[0]:
-                    adj_close = chunk_data["Close"].copy()
-                else:
-                    continue
+                metric_level = None
+                ticker_level = None
+                
+                # Dynamically locate which index level contains price metrics
+                for level_idx in [0, 1]:
+                    unique_vals = chunk_data.columns.get_level_values(level_idx).unique()
+                    if any(m in unique_vals for m in ["Adj Close", "Close"]):
+                        metric_level = level_idx
+                    else:
+                        ticker_level = level_idx
+                
+                # Set fallback levels if levels cannot be dynamically determined
+                if metric_level is None or ticker_level is None:
+                    metric_level, ticker_level = 0, 1
+                
+                # Choose Adj Close if available, fallback to Close
+                available_metrics = chunk_data.columns.get_level_values(metric_level).unique()
+                target_metric = "Adj Close" if "Adj Close" in available_metrics else "Close"
+                
+                # Extract columns under targeted metric using cross-section
+                adj_close = chunk_data.xs(target_metric, axis=1, level=metric_level).copy()
+                
+            # 2. Handle Flat Column Structures (single-ticker results)
             else:
-                # Flat column scenario (e.g. only 1 ticker was returned in the chunk)
                 if "Adj Close" in chunk_data.columns:
                     adj_close = chunk_data[["Adj Close"]].copy()
                 elif "Close" in chunk_data.columns:
                     adj_close = chunk_data[["Close"]].copy()
                 else:
                     continue
-                # Align flat column name to ticker code
+                # Map metric column directly to ticker symbol
                 adj_close.columns = [chunk[0]]
                 
-            # Defensive fix: Explicitly enforce "Date" index name 
-            # to prevent KeyError in reset_index().melt() under yfinance v1.4.0+
+            # 3. Cast to DataFrame if slicing yielded a pd.Series (prevents AttributeError on .columns)
+            if isinstance(adj_close, pd.Series):
+                adj_close = adj_close.to_frame()
+                
+            # 4. Explicitly enforce "Date" index name on the extracted DataFrame
             adj_close.index.name = "Date"
             
-            # Reshape into long-format Pandas DataFrame
+            # 5. Melt to long format
             melted = adj_close.reset_index().melt(
                 id_vars="Date", 
                 value_vars=adj_close.columns, 
@@ -242,7 +285,7 @@ def download_historical_prices(yahoo_tickers: list, period: str = "60d") -> pl.D
                 value_name="close"
             )
             
-            # Instantly cast to Polars to save memory
+            # Cast to Polars to save memory
             pl_df = pl.from_pandas(melted).rename({"Date": "date"}).drop_nulls()
             dfs.append(pl_df)
             
@@ -344,6 +387,10 @@ def main():
         how="left"
     )
     
+    # Calculate and log mapping statistics
+    successfully_joined = submission_df.filter(pl.col("signal").is_not_null()).height
+    print(f"[Sanity Check] Successfully mapped and calculated signals for {successfully_joined} out of {universe_df.height} tickers.")
+    
     # Ensure any missed tickers default to neutral 0.5 to satisfy the submission volume requirement
     submission_df = submission_df.with_columns(
         pl.col("signal").fill_null(0.5)
@@ -354,6 +401,17 @@ def main():
         pl.col("signal").clip(lower_bound=0.01, upper_bound=0.99)
     )
     
+    # 7. Pre-flight Validation (Explicitly enforce non-zero Standard Deviation)
+    signal_std = submission_df["signal"].std()
+    print(f"[Sanity Check] Signal vector standard deviation: {signal_std}")
+    
+    if signal_std is None or signal_std < 1e-6:
+        raise ValueError(
+            f"Pre-flight Abort: Calculated submission standard deviation is {signal_std}. "
+            f"This indicates a formatting mismatch between model outputs and the target universe. "
+            f"Aborting upload to preserve submission quota."
+        )
+        
     # Write to local file
     final_output = submission_df.select([target_col, "signal"])
     output_path = "submission.csv"
@@ -364,7 +422,7 @@ def main():
     if os.path.exists("live.parquet"):
         os.remove("live.parquet")
     
-    # 7. Model ID Validation & Upload
+    # 8. Model ID Validation & Upload
     print("Finding model ID programmatically...")
     try:
         models = sapi.get_models()

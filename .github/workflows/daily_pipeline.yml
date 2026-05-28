@@ -2,11 +2,9 @@ name: Daily_Signals_Automation
 
 on:
   schedule:
-    # Triggers every day at 19:00 UTC (10:00 PM Ethiopia)
     - cron: '0 19 * * *' 
-  workflow_dispatch: # Allows you to click the button manually
+  workflow_dispatch: 
 
-# Clean Log Hygiene
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
@@ -22,10 +20,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Pinned Quant Stack
+      - name: Install Quant Stack
         run: |
           pip install --upgrade pip
-          # Institutional Stability: Version Pinning
           pip install pandas==2.1.4 pandas-datareader==0.10.0 numpy==1.26.4
           pip install yfinance numerapi lxml beautifulsoup4
 
@@ -33,4 +30,5 @@ jobs:
         env:
           NUMERAI_PUBLIC_KEY: ${{ secrets.NUMERAI_PUBLIC_KEY }}
           NUMERAI_SECRET_KEY: ${{ secrets.NUMERAI_SECRET_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python signals_script.py

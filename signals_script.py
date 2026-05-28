@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Numerai Signals Submission Pipeline
-Author: Dawit Yimer 
+Author: MScFE Team / Dawit Yimer Production Setup
 Description: Low-memory, crash-resistant production pipeline using Polars.
-             Handles universe handshakes, robust ticker format conversions, 
-             20-day mean reversion alpha logic, and FRED T10Y2Y macro risk shields.
+             Dynamically retrieves the official universe via live.parquet,
+             handles ticker mapping, and applies mean reversion and risk shields.
 """
 import os
 import sys
@@ -24,44 +24,47 @@ MODEL_SLOT_NAME = "dawityimer"
 # ==========================================
 # UNIVERSE HANDSHAKE
 # ==========================================
-def fetch_official_universe(sapi: numerapi.SignalsAPI) -> list:
+def fetch_official_universe(sapi: numerapi.SignalsAPI) -> tuple[list[str], str]:
     """
-    Downloads the official eligible ticker universe from Numerai Signals.
-    Implements multiple fallback channels for self-healing capability.
+    Downloads the official live.parquet file and extracts the active universe tickers.
+    Tries successive active data versions (v2.1, v2.0, v1.0) for redundancy.
+    Returns (list_of_tickers, ticker_column_name).
     """
-    print("[Universe Handshake] Querying active ticker list...")
-    # 1. Try preferred method as specified in guidelines
-    try:
-        if hasattr(sapi, 'get_eligible_tickers'):
-            print("[Universe Handshake] Attempting sapi.get_eligible_tickers()...")
-            tickers = sapi.get_eligible_tickers()
-            if tickers and len(tickers) > 100:
-                return tickers
-    except Exception as e:
-        print(f"[Universe Handshake] sapi.get_eligible_tickers failed: {e}")
-
-    # 2. Fallback to ticker_universe
-    try:
-        print("[Universe Handshake] Attempting sapi.ticker_universe()...")
-        tickers = sapi.ticker_universe()
-        if tickers and len(tickers) > 100:
-            return tickers
-    except Exception as e:
-        print(f"[Universe Handshake] sapi.ticker_universe failed: {e}")
-
-    # 3. Direct CSV download from public endpoint
-    try:
-        print("[Universe Handshake] Attempting direct S3 download of current universe...")
-        url = "https://numerai-signals-public-data.s3-us-west-2.amazonaws.com/latest_universe.csv"
-        df = pd.read_csv(url)
-        for col in ["bloomberg_ticker", "ticker", "numerai_ticker"]:
-            if col in df.columns:
-                tickers = df[col].dropna().tolist()
+    print("[Universe Handshake] Querying active ticker list via live.parquet...")
+    versions = ["signals/v2.1/live.parquet", "signals/v2.0/live.parquet", "signals/v1.0/live.parquet"]
+    
+    for version in versions:
+        try:
+            print(f"[Universe Handshake] Attempting download of '{version}'...")
+            sapi.download_dataset(version, "live.parquet")
+            if os.path.exists("live.parquet"):
+                print(f"[Universe Handshake] Successfully downloaded '{version}'")
+                
+                # Load with Polars to inspect the active column names
+                df = pl.read_parquet("live.parquet")
+                for col in ["numerai_ticker", "bloomberg_ticker", "ticker"]:
+                    if col in df.columns:
+                        tickers = df[col].drop_nulls().unique().to_list()
+                        if tickers and len(tickers) > 100:
+                            print(f"[Universe Handshake] Extracted {len(tickers)} tickers from column '{col}'")
+                            return tickers, col
+        except Exception as e:
+            print(f"[Universe Handshake] Download/Read failed for '{version}': {e}")
+            continue
+            
+    # Legacy fallbacks in case API dataset catalog is entirely unresponsive
+    print("[Universe Handshake] Dataset download failed. Trying legacy fallback methods...")
+    for method_name in ["get_eligible_tickers", "ticker_universe"]:
+        if hasattr(sapi, method_name):
+            try:
+                method = getattr(sapi, method_name)
+                tickers = method()
                 if tickers and len(tickers) > 100:
-                    return tickers
-    except Exception as e:
-        print(f"[Universe Handshake] S3 fallback failed: {e}")
-
+                    print(f"[Universe Handshake] Fallback retrieved {len(tickers)} tickers via legacy {method_name}")
+                    return tickers, "bloomberg_ticker"
+            except Exception as e:
+                print(f"[Universe Handshake] Legacy fallback '{method_name}' failed: {e}")
+                
     raise RuntimeError("Critical: Failed to resolve the official universe across all channels.")
 
 # ==========================================
@@ -69,99 +72,90 @@ def fetch_official_universe(sapi: numerapi.SignalsAPI) -> list:
 # ==========================================
 class TickerConverter:
     """
-    Maps Bloomberg tickers from Numerai to Yahoo Finance tickers, and vice-versa.
-    Utilizes official S3 mapping database with a programmatic fallback heuristic.
+    Maps Bloomberg & Numerai tickers to Yahoo Finance tickers, and vice-versa.
+    Utilizes the official S3 mapping database with a programmatic fallback heuristic.
     """
     def __init__(self, ticker_map_url: str):
         print("[Ticker Map] Downloading mapping table from S3...")
-        self.bbg_to_yahoo = {}
-        self.yahoo_to_bbg = {}
+        self.to_yahoo_map = {}
+        self.to_target_map = {}  # yahoo -> target_ticker (supports multiple formats)
         
         try:
-            # Polars low-memory download
             df = pl.read_csv(ticker_map_url)
         except Exception as e:
             print(f"[Ticker Map] Polars read failed, using Pandas fallback: {e}")
             df = pl.from_pandas(pd.read_csv(ticker_map_url))
             
         for r in df.iter_rows(named=True):
-            bbg = r.get("bloomberg_ticker") or r.get("ticker")
+            bbg = r.get("bloomberg_ticker")
+            num_t = r.get("ticker")  # in the map file, 'ticker' represents the numerai_ticker
             yahoo = r.get("yahoo")
-            if bbg and yahoo and str(yahoo).strip() != "" and str(yahoo) != "nan":
-                bbg_str = str(bbg).strip()
+            
+            if yahoo and str(yahoo).strip() != "" and str(yahoo) != "nan":
                 yahoo_str = str(yahoo).strip()
-                self.bbg_to_yahoo[bbg_str] = yahoo_str
-                self.yahoo_to_bbg[yahoo_str] = bbg_str
+                
+                if bbg and str(bbg).strip() != "" and str(bbg) != "nan":
+                    self.to_yahoo_map[str(bbg).strip()] = yahoo_str
+                    
+                if num_t and str(num_t).strip() != "" and str(num_t) != "nan":
+                    self.to_yahoo_map[str(num_t).strip()] = yahoo_str
+                
+                self.to_target_map[yahoo_str] = {
+                    "bloomberg_ticker": str(bbg).strip() if bbg else None,
+                    "numerai_ticker": str(num_t).strip() if num_t else None,
+                    "ticker": str(num_t).strip() if num_t else None
+                }
 
-    def to_yahoo(self, bbg_ticker: str) -> str:
-        bbg_clean = bbg_ticker.strip()
-        if bbg_clean in self.bbg_to_yahoo:
-            return self.bbg_to_yahoo[bbg_clean]
+    def to_yahoo(self, source_ticker: str) -> str:
+        src_clean = source_ticker.strip()
+        if src_clean in self.to_yahoo_map:
+            return self.to_yahoo_map[src_clean]
         
         # Rule-based fallback heuristic if ticker is missing from the S3 database
-        parts = bbg_clean.split(" ")
+        parts = src_clean.split(" ")
         if len(parts) == 2:
             ticker, exchange = parts[0], parts[1]
             ticker = ticker.replace("/", "-")
             
             exchange_map = {
-                "US": "",
-                "JP": ".T",
-                "JT": ".T",
-                "KS": ".KS",
-                "LN": ".L",
-                "CN": ".TO",
-                "AU": ".AX",
-                "FP": ".PA",
-                "GY": ".DE",
-                "HK": ".HK",
-                "SS": ".SS",
-                "SZ": ".SZ",
-                "ID": ".JK",
-                "IM": ".MI",
-                "NA": ".AS",
-                "SP": ".MC",
-                "SW": ".SW",
-                "TA": ".TA",
+                "US": "", "JP": ".T", "JT": ".T", "KS": ".KS", "LN": ".L",
+                "CN": ".TO", "AU": ".AX", "FP": ".PA", "GY": ".DE", "HK": ".HK",
+                "SS": ".SS", "SZ": ".SZ", "ID": ".JK", "IM": ".MI", "NA": ".AS",
+                "SP": ".MC", "SW": ".SW", "TA": ".TA"
             }
             suffix = exchange_map.get(exchange, f".{exchange}")
             return f"{ticker}{suffix}" if suffix else ticker
             
-        return bbg_clean
+        return src_clean
 
-    def to_bbg(self, yahoo_ticker: str) -> str:
+    def to_target(self, yahoo_ticker: str, target_col: str) -> str:
         yahoo_clean = yahoo_ticker.strip()
-        if yahoo_clean in self.yahoo_to_bbg:
-            return self.yahoo_to_bbg[yahoo_clean]
-            
-        # Rule-based fallback heuristic to translate back to Bloomberg format
-        if "." in yahoo_clean:
-            ticker, suffix = yahoo_clean.split(".", 1)
-            ticker = ticker.replace("-", "/")
-            
-            inv_map = {
-                "T": "JP",
-                "KS": "KS",
-                "L": "LN",
-                "TO": "CN",
-                "AX": "AU",
-                "PA": "FP",
-                "DE": "GY",
-                "HK": "HK",
-                "SS": "SS",
-                "SZ": "SZ",
-                "JK": "ID",
-                "MI": "IM",
-                "AS": "NA",
-                "MC": "SP",
-                "SW": "SW",
-                "TA": "TA"
-            }
-            exchange = inv_map.get(suffix, suffix.upper())
-            return f"{ticker} {exchange}"
+        if yahoo_clean in self.to_target_map:
+            mapped_val = self.to_target_map[yahoo_clean].get(target_col)
+            if mapped_val:
+                return mapped_val
+        
+        # Heuristic fallback to translate Yahoo back to Bloomberg or Numerai formats
+        if target_col in ["numerai_ticker", "ticker"]:
+            if "." in yahoo_clean:
+                ticker, suffix = yahoo_clean.split(".", 1)
+                ticker = ticker.replace("-", "/")
+                return f"{ticker} {suffix.upper()}"
+            else:
+                return f"{yahoo_clean} US"
         else:
-            ticker = yahoo_clean.replace("-", "/")
-            return f"{ticker} US"
+            if "." in yahoo_clean:
+                ticker, suffix = yahoo_clean.split(".", 1)
+                ticker = ticker.replace("-", "/")
+                inv_map = {
+                    "T": "JP", "KS": "KS", "L": "LN", "TO": "CN", "AX": "AU",
+                    "PA": "FP", "DE": "GY", "HK": "HK", "SS": "SS", "SZ": "SZ",
+                    "JK": "ID", "MI": "IM", "AS": "NA", "MC": "SP", "SW": "SW", "TA": "TA"
+                }
+                exchange = inv_map.get(suffix, suffix.upper())
+                return f"{ticker} {exchange}"
+            else:
+                return f"{yahoo_clean} US"
 
 # ==========================================
 # RISK SHIELD (FRED T10Y2Y)
@@ -252,16 +246,16 @@ def main():
         
     sapi = numerapi.SignalsAPI(public_key, secret_key)
     
-    # 1. Official Universe Handshake
-    eligible_bbg_tickers = fetch_official_universe(sapi)
-    print(f"Retrieved official universe of {len(eligible_bbg_tickers)} active tickers.")
+    # 1. Official Universe Handshake (Retrieves exact, active column name and tickers)
+    eligible_tickers, target_col = fetch_official_universe(sapi)
+    print(f"Retrieved official universe of {len(eligible_tickers)} active tickers using target column: '{target_col}'")
     
     # 2. Ticker Conversion Setup
     converter = TickerConverter(TICKER_MAP_URL)
     
-    # Convert BBG to Yahoo Tickers for downloading
-    yahoo_tickers_to_fetch = list(set([converter.to_yahoo(t) for t in eligible_bbg_tickers]))
-    print(f"Mapped {len(eligible_bbg_tickers)} Bloomberg tickers to {len(yahoo_tickers_to_fetch)} unique Yahoo tickers.")
+    # Convert active tickers to Yahoo Tickers for downloading
+    yahoo_tickers_to_fetch = list(set([converter.to_yahoo(t) for t in eligible_tickers]))
+    print(f"Mapped {len(eligible_tickers)} source tickers to {len(yahoo_tickers_to_fetch)} unique Yahoo tickers.")
     
     # 3. Memory-Safe Market Data Fetch (Polars/Vectorized chunking)
     prices_df = download_historical_prices(yahoo_tickers_to_fetch, period="60d")
@@ -303,9 +297,9 @@ def main():
         (pl.col("rank") / (num_signals + 1)).alias("signal")
     )
     
-    # Map back to Bloomberg tickers
+    # Map back to the active identifier column format
     latest_signals = latest_signals.with_columns(
-        pl.col("ticker").map_elements(lambda x: converter.to_bbg(x), return_dtype=pl.String).alias("bloomberg_ticker")
+        pl.col("ticker").map_elements(lambda x: converter.to_target(x, target_col), return_dtype=pl.String).alias(target_col)
     )
     
     # 5. Risk Shield Check (FRED Macro Overlay)
@@ -319,15 +313,15 @@ def main():
         )
         
     # 6. Complete Universe Align & Safe-Fill
-    # Merge computed signals back to the complete universe, ensuring we submit 100% of required tickers.
-    universe_df = pl.DataFrame({"bloomberg_ticker": eligible_bbg_tickers})
+    # Left-join computed signals to the downloaded active universe to ensure complete coverage.
+    universe_df = pl.DataFrame({target_col: eligible_tickers})
     submission_df = universe_df.join(
-        latest_signals.select(["bloomberg_ticker", "signal"]),
-        on="bloomberg_ticker",
+        latest_signals.select([target_col, "signal"]),
+        on=target_col,
         how="left"
     )
     
-    # Ensure any missed tickers are safely designated 0.5 (Neutral)
+    # Ensure any missed tickers default to neutral 0.5 to satisfy the submission volume requirement
     submission_df = submission_df.with_columns(
         pl.col("signal").fill_null(0.5)
     )
@@ -337,11 +331,15 @@ def main():
         pl.col("signal").clip(lower_bound=0.01, upper_bound=0.99)
     )
     
-    # Write cleanly to file
-    final_output = submission_df.select(["bloomberg_ticker", "signal"])
+    # Write to local file
+    final_output = submission_df.select([target_col, "signal"])
     output_path = "submission.csv"
     final_output.write_csv(output_path)
     print(f"Generated submission file with {final_output.height} valid tickers.")
+    
+    # Clean up local file to free disk space
+    if os.path.exists("live.parquet"):
+        os.remove("live.parquet")
     
     # 7. Model ID Validation & Upload
     print("Finding model ID programmatically...")

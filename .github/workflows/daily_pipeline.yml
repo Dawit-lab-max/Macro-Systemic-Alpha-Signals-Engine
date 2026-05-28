@@ -24,7 +24,7 @@ jobs:
         run: |
           pip install --upgrade pip
           # Institutional Stability: Version Pinning
-          pip install pandas==2.1.4 pandas-datareader==0.10.0 numpy==1.26.4
+          pip install pandas==2.1.4 pandas-datareader==0.10.0 numpy==1.26.4 polars==1.0.0
           pip install yfinance numerapi lxml beautifulsoup4 requests
 
       - name: Execute Macro-Systemic Engine

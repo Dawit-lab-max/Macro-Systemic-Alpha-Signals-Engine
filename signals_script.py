@@ -4,9 +4,9 @@ Numerai Signals Submission Pipeline
 Author: MScFE Team / Dawit Yimer Production Setup
 Description: Low-memory, crash-resistant production pipeline using Polars.
              Dynamically retrieves the official universe via live.parquet,
-             handles ticker mapping via pure-Python rules (no S3 file dependencies),
+             handles ticker mapping via pure-Python rules,
              and applies mean reversion and FRED macro risk shields.
-             Includes ISO country code alignment and pre-flight SD validation.
+             Includes 120-day download depth and structured diagnostics.
 """
 import os
 import sys
@@ -78,7 +78,7 @@ class TickerConverter:
     for 'numerai_ticker' compatibility, and legacy Bloomberg suffixes otherwise.
     """
     def __init__(self):
-        # Forward maps (Numerai ISO country code -> Yahoo suffix)
+        # Forward maps (Exchange ISO code -> Yahoo suffix)
         self.iso_to_yahoo_suffix = {
             "US": "",
             "JP": ".T",
@@ -102,7 +102,7 @@ class TickerConverter:
             "PL": ".WA",
             "ZA": ".JO",
         }
-        # Inverse maps (Yahoo suffix -> Numerai ISO country code)
+        # Inverse maps (Yahoo suffix -> Exchange ISO code)
         self.yahoo_suffix_to_iso = {
             "": "US",
             "T": "JP",
@@ -216,7 +216,7 @@ def get_latest_yield_curve_spread() -> float:
 # ==========================================
 # DATA DOWNLOADER
 # ==========================================
-def download_historical_prices(yahoo_tickers: list, period: str = "60d") -> pl.DataFrame:
+def download_historical_prices(yahoo_tickers: list, period: str = "120d") -> pl.DataFrame:
     """
     Downloads historical data from Yahoo Finance in optimal chunks.
     Melted to long format immediately to prevent RAM blowouts under 7GB limit.
@@ -323,8 +323,9 @@ def main():
     yahoo_tickers_to_fetch = list(set([converter.to_yahoo(t) for t in eligible_tickers]))
     print(f"Mapped {len(eligible_tickers)} source tickers to {len(yahoo_tickers_to_fetch)} unique Yahoo tickers.")
     
-    # 3. Memory-Safe Market Data Fetch (Polars/Vectorized chunking)
-    prices_df = download_historical_prices(yahoo_tickers_to_fetch, period="60d")
+    # 3. Memory-Safe Market Data Fetch (Polars/Vectorized chunking - 120 days history)
+    prices_df = download_historical_prices(yahoo_tickers_to_fetch, period="120d")
+    print(f"[Diagnostics] prices_df raw download shape: {prices_df.shape}")
     
     # 4. Alpha Calculation: MScFE 20-Day Mean Reversion
     print("Computing rolling mean reversion z-scores...")
@@ -336,11 +337,15 @@ def main():
         pl.col("close").rolling_std(window_size=20).over("ticker").alias("std_20")
     ])
     
-    # Drop rows without enough history
+    # Drop rows without enough history (requiring std_20 calculated on 20 trading days)
     prices_df = prices_df.filter(
         (pl.col("std_20").is_not_null()) & (pl.col("std_20") > 1e-8)
     )
+    print(f"[Diagnostics] prices_df post-std_20 filtering shape: {prices_df.shape}")
     
+    if prices_df.height == 0:
+        raise ValueError("Critical Abort: prices_df was emptied after filtering. Please inspect yfinance density.")
+
     # Calculate Z-score
     prices_df = prices_df.with_columns(
         ((pl.col("close") - pl.col("ma_20")) / pl.col("std_20")).alias("z_score")
@@ -348,6 +353,7 @@ def main():
     
     # Extract latest signals for each ticker
     latest_signals = prices_df.group_by("ticker").last()
+    print(f"[Diagnostics] latest_signals pre-mapping shape: {latest_signals.shape}")
     
     # Apply Mean Reversion: Inverse of Z-score
     latest_signals = latest_signals.with_columns(
@@ -368,6 +374,11 @@ def main():
         pl.col("ticker").map_elements(lambda x: converter.to_target(x, target_col), return_dtype=pl.String).alias(target_col)
     )
     
+    # Log sample mapped elements to confirm format consistency
+    if latest_signals.height > 0:
+        print(f"[Diagnostics] Raw 'ticker' column samples: {latest_signals['ticker'].head(5).to_list()}")
+        print(f"[Diagnostics] Mapped '{target_col}' column samples: {latest_signals[target_col].head(5).to_list()}")
+        
     # 5. Risk Shield Check (FRED Macro Overlay)
     spread = get_latest_yield_curve_spread()
     print(f"FRED Yield Spread: {spread}%")
@@ -381,6 +392,8 @@ def main():
     # 6. Complete Universe Align & Safe-Fill
     # Left-join computed signals to the downloaded active universe to ensure complete coverage.
     universe_df = pl.DataFrame({target_col: eligible_tickers})
+    print(f"[Diagnostics] universe_df sample: {universe_df[target_col].head(5).to_list()}")
+    
     submission_df = universe_df.join(
         latest_signals.select([target_col, "signal"]),
         on=target_col,

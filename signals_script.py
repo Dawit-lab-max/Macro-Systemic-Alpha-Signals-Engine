@@ -4,7 +4,8 @@ Numerai Signals Submission Pipeline
 Author: MScFE Team / Dawit Yimer Production Setup
 Description: Low-memory, crash-resistant production pipeline using Polars.
              Dynamically retrieves the official universe via live.parquet,
-             handles ticker mapping, and applies mean reversion and risk shields.
+             handles ticker mapping via pure-Python rules (no S3 file dependencies),
+             and applies mean reversion and FRED macro risk shields.
 """
 import os
 import sys
@@ -18,7 +19,6 @@ import numerapi
 # CONFIGURATION & CONSTANTS
 # ==========================================
 FRED_API_KEY = "3699988d98d460d752a241f85df9532f"
-TICKER_MAP_URL = "https://numerai-signals-public-data.s3-us-west-2.amazonaws.com/signals_ticker_map_w_bbg.csv"
 MODEL_SLOT_NAME = "dawityimer"
 
 # ==========================================
@@ -72,90 +72,97 @@ def fetch_official_universe(sapi: numerapi.SignalsAPI) -> tuple[list[str], str]:
 # ==========================================
 class TickerConverter:
     """
-    Maps Bloomberg & Numerai tickers to Yahoo Finance tickers, and vice-versa.
-    Utilizes the official S3 mapping database with a programmatic fallback heuristic.
+    Pure-Python Rule-Based Ticker Converter.
+    Eliminates dependencies on external S3 CSV mapping databases.
+    Maps Bloomberg/Numerai formats (e.g., 'AAPL US', '7203 JP') to Yahoo, and vice-versa.
     """
-    def __init__(self, ticker_map_url: str):
-        print("[Ticker Map] Downloading mapping table from S3...")
-        self.to_yahoo_map = {}
-        self.to_target_map = {}  # yahoo -> target_ticker (supports multiple formats)
-        
-        try:
-            df = pl.read_csv(ticker_map_url)
-        except Exception as e:
-            print(f"[Ticker Map] Polars read failed, using Pandas fallback: {e}")
-            df = pl.from_pandas(pd.read_csv(ticker_map_url))
-            
-        for r in df.iter_rows(named=True):
-            bbg = r.get("bloomberg_ticker")
-            num_t = r.get("ticker")  # in the map file, 'ticker' represents the numerai_ticker
-            yahoo = r.get("yahoo")
-            
-            if yahoo and str(yahoo).strip() != "" and str(yahoo) != "nan":
-                yahoo_str = str(yahoo).strip()
-                
-                if bbg and str(bbg).strip() != "" and str(bbg) != "nan":
-                    self.to_yahoo_map[str(bbg).strip()] = yahoo_str
-                    
-                if num_t and str(num_t).strip() != "" and str(num_t) != "nan":
-                    self.to_yahoo_map[str(num_t).strip()] = yahoo_str
-                
-                self.to_target_map[yahoo_str] = {
-                    "bloomberg_ticker": str(bbg).strip() if bbg else None,
-                    "numerai_ticker": str(num_t).strip() if num_t else None,
-                    "ticker": str(num_t).strip() if num_t else None
-                }
+    def __init__(self):
+        # Forward maps (Exchange country code -> Yahoo suffix)
+        self.exchange_to_yahoo_suffix = {
+            "US": "",
+            "JP": ".T",
+            "KR": ".KS",
+            "LN": ".L",
+            "CN": ".TO",
+            "AU": ".AX",
+            "FP": ".PA",
+            "GY": ".DE",
+            "HK": ".HK",
+            "SS": ".SS",
+            "SZ": ".SZ",
+            "ID": ".JK",
+            "IM": ".MI",
+            "NA": ".AS",
+            "SP": ".MC",
+            "SW": ".SW",
+            "TA": ".TA",
+            "IN": ".NS",
+            "BR": ".SA",
+            "MX": ".MX",
+            "CH": ".SW",
+            "PL": ".WA",
+            "ZA": ".JO",
+        }
+        # Inverse maps (Yahoo suffix -> Exchange country code)
+        self.yahoo_suffix_to_exchange = {
+            "T": "JP",
+            "KS": "KR",
+            "L": "LN",
+            "TO": "CN",
+            "AX": "AU",
+            "PA": "FP",
+            "DE": "GY",
+            "HK": "HK",
+            "SS": "SS",
+            "SZ": "SZ",
+            "JK": "ID",
+            "MI": "IM",
+            "AS": "NA",
+            "MC": "SP",
+            "SW": "SW",
+            "TA": "TA",
+            "NS": "IN",
+            "SA": "BR",
+            "MX": "MX",
+            "WA": "PL",
+            "JO": "ZA",
+        }
 
     def to_yahoo(self, source_ticker: str) -> str:
-        src_clean = source_ticker.strip()
-        if src_clean in self.to_yahoo_map:
-            return self.to_yahoo_map[src_clean]
-        
-        # Rule-based fallback heuristic if ticker is missing from the S3 database
+        if not source_ticker:
+            return ""
+        src_clean = str(source_ticker).strip()
         parts = src_clean.split(" ")
         if len(parts) == 2:
-            ticker, exchange = parts[0], parts[1]
+            ticker, exchange = parts[0], parts[1].upper()
             ticker = ticker.replace("/", "-")
             
-            exchange_map = {
-                "US": "", "JP": ".T", "JT": ".T", "KS": ".KS", "LN": ".L",
-                "CN": ".TO", "AU": ".AX", "FP": ".PA", "GY": ".DE", "HK": ".HK",
-                "SS": ".SS", "SZ": ".SZ", "ID": ".JK", "IM": ".MI", "NA": ".AS",
-                "SP": ".MC", "SW": ".SW", "TA": ".TA"
-            }
-            suffix = exchange_map.get(exchange, f".{exchange}")
-            return f"{ticker}{suffix}" if suffix else ticker
-            
+            if exchange in self.exchange_to_yahoo_suffix:
+                suffix = self.exchange_to_yahoo_suffix[exchange]
+                return f"{ticker}{suffix}"
+            else:
+                return f"{ticker}.{exchange.lower()}"
         return src_clean
 
     def to_target(self, yahoo_ticker: str, target_col: str) -> str:
-        yahoo_clean = yahoo_ticker.strip()
-        if yahoo_clean in self.to_target_map:
-            mapped_val = self.to_target_map[yahoo_clean].get(target_col)
-            if mapped_val:
-                return mapped_val
-        
-        # Heuristic fallback to translate Yahoo back to Bloomberg or Numerai formats
-        if target_col in ["numerai_ticker", "ticker"]:
-            if "." in yahoo_clean:
-                ticker, suffix = yahoo_clean.split(".", 1)
-                ticker = ticker.replace("-", "/")
-                return f"{ticker} {suffix.upper()}"
+        if not yahoo_ticker:
+            return ""
+        yahoo_clean = str(yahoo_ticker).strip()
+        if "." in yahoo_clean:
+            ticker, suffix = yahoo_clean.split(".", 1)
+            ticker = ticker.replace("-", "/")
+            suffix_upper = suffix.upper()
+            
+            if suffix in self.yahoo_suffix_to_exchange:
+                exchange = self.yahoo_suffix_to_exchange[suffix]
+            elif suffix_upper in self.yahoo_suffix_to_exchange:
+                exchange = self.yahoo_suffix_to_exchange[suffix_upper]
             else:
-                return f"{yahoo_clean} US"
+                exchange = suffix_upper
+            return f"{ticker} {exchange}"
         else:
-            if "." in yahoo_clean:
-                ticker, suffix = yahoo_clean.split(".", 1)
-                ticker = ticker.replace("-", "/")
-                inv_map = {
-                    "T": "JP", "KS": "KS", "L": "LN", "TO": "CN", "AX": "AU",
-                    "PA": "FP", "DE": "GY", "HK": "HK", "SS": "SS", "SZ": "SZ",
-                    "JK": "ID", "MI": "IM", "AS": "NA", "MC": "SP", "SW": "SW", "TA": "TA"
-                }
-                exchange = inv_map.get(suffix, suffix.upper())
-                return f"{ticker} {exchange}"
-            else:
-                return f"{yahoo_clean} US"
+            ticker = yahoo_clean.replace("-", "/")
+            return f"{ticker} US"
 
 # ==========================================
 # RISK SHIELD (FRED T10Y2Y)
@@ -251,7 +258,7 @@ def main():
     print(f"Retrieved official universe of {len(eligible_tickers)} active tickers using target column: '{target_col}'")
     
     # 2. Ticker Conversion Setup
-    converter = TickerConverter(TICKER_MAP_URL)
+    converter = TickerConverter()
     
     # Convert active tickers to Yahoo Tickers for downloading
     yahoo_tickers_to_fetch = list(set([converter.to_yahoo(t) for t in eligible_tickers]))

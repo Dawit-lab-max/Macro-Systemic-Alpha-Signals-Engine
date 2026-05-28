@@ -6,7 +6,7 @@ Description: Low-memory, crash-resistant production pipeline using Polars.
              Dynamically retrieves the official universe via live.parquet,
              handles ticker mapping via pure-Python rules,
              and applies mean reversion and FRED macro risk shields.
-             Uses the officially supported "3mo" period parameter for yfinance.
+             Uses a browser-mimicking requests session to bypass rate-limiting.
 """
 import os
 import sys
@@ -74,8 +74,8 @@ def fetch_official_universe(sapi: numerapi.SignalsAPI) -> tuple[list[str], str]:
 class TickerConverter:
     """
     Pure-Python Rule-Based Ticker Converter.
-    Maps tickers to/from Yahoo Finance using ISO two-letter country execution codes
-    for 'numerai_ticker' compatibility, and legacy Bloomberg suffixes otherwise.
+    Eliminates dependencies on external S3 CSV mapping databases.
+    Maps Bloomberg/Numerai formats (e.g., 'AAPL US', '7203 JP') to Yahoo, and vice-versa.
     """
     def __init__(self):
         # Forward maps (Exchange ISO code -> Yahoo suffix)
@@ -220,7 +220,18 @@ def download_historical_prices(yahoo_tickers: list, period: str = "3mo") -> pl.D
     """
     Downloads historical data from Yahoo Finance in optimal chunks.
     Melted to long format immediately to prevent RAM blowouts under 7GB limit.
+    Uses custom requests session with browser headers to bypass cloud IP scraping blocks.
     """
+    # Create custom session with modern desktop user-agent headers
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive'
+    })
+
     chunk_size = 400
     dfs = []
     
@@ -228,8 +239,18 @@ def download_historical_prices(yahoo_tickers: list, period: str = "3mo") -> pl.D
         chunk = yahoo_tickers[i:i + chunk_size]
         print(f"[Data Downloader] Batch {i // chunk_size + 1}/{(len(yahoo_tickers) - 1) // chunk_size + 1}...")
         try:
-            chunk_data = yf.download(chunk, period=period, interval="1d", progress=False)
+            # Pass custom session with browser headers
+            chunk_data = yf.download(
+                chunk, 
+                period=period, 
+                interval="1d", 
+                progress=False, 
+                session=session,
+                threads=True
+            )
+            
             if chunk_data.empty:
+                print(f"[Data Downloader] Warning: Empty data returned for batch starting at index {i}")
                 continue
                 
             # Assign index name to "Date" before processing structure

@@ -1,5 +1,5 @@
 # Macro-Systemic Alpha Signals Engine
-**By Dawit Yimer, MScFE** 
+**By Dawit Yimer Gebreegziabehair, MScFE** 
 
 ## What it is
 This is a fully automated signals pipeline for the Numerai Signals tournament. It analyzes the S&P 500 universe to find predictive signals while monitoring the U.S. Federal Reserve for systemic risk.

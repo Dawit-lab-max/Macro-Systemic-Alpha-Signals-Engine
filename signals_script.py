@@ -6,6 +6,7 @@ Description: Low-memory, crash-resistant production pipeline using Polars.
              Dynamically retrieves the official universe via live.parquet,
              handles ticker mapping via pure-Python rules (no S3 file dependencies),
              and applies mean reversion and FRED macro risk shields.
+             Includes explicit index normalization to handle yfinance v1.4.0+ regressions.
 """
 import os
 import sys
@@ -210,14 +211,29 @@ def download_historical_prices(yahoo_tickers: list, period: str = "60d") -> pl.D
             if chunk_data.empty:
                 continue
                 
-            # Safely extract Adjusted Close
-            if "Adj Close" in chunk_data.columns:
-                adj_close = chunk_data["Adj Close"]
-            elif isinstance(chunk_data.columns, pd.MultiIndex):
-                adj_close = chunk_data.xs("Adj Close", axis=1, level=1)
+            # Parse metrics depending on MultiIndex vs Flat columns
+            if isinstance(chunk_data.columns, pd.MultiIndex):
+                if "Adj Close" in chunk_data.columns.levels[0]:
+                    adj_close = chunk_data["Adj Close"].copy()
+                elif "Close" in chunk_data.columns.levels[0]:
+                    adj_close = chunk_data["Close"].copy()
+                else:
+                    continue
             else:
-                adj_close = chunk_data
+                # Flat column scenario (e.g. only 1 ticker was returned in the chunk)
+                if "Adj Close" in chunk_data.columns:
+                    adj_close = chunk_data[["Adj Close"]].copy()
+                elif "Close" in chunk_data.columns:
+                    adj_close = chunk_data[["Close"]].copy()
+                else:
+                    continue
+                # Align flat column name to ticker code
+                adj_close.columns = [chunk[0]]
                 
+            # Defensive fix: Explicitly enforce "Date" index name 
+            # to prevent KeyError in reset_index().melt() under yfinance v1.4.0+
+            adj_close.index.name = "Date"
+            
             # Reshape into long-format Pandas DataFrame
             melted = adj_close.reset_index().melt(
                 id_vars="Date", 

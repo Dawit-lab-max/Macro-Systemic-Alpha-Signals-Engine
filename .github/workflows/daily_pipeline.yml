@@ -2,11 +2,9 @@ name: Daily_Signals_Automation
 
 on:
   schedule:
-    # This triggers the robot every day at 19:00 UTC (10:00 PM in Ethiopia)
     - cron: '0 19 * * *' 
-  workflow_dispatch: # Allows you to manually trigger the "First Strike"
+  workflow_dispatch: 
 
-# Institutional Log Hygiene
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
@@ -25,7 +23,7 @@ jobs:
       - name: Install Quant Stack
         run: |
           pip install --upgrade pip
-          pip install numpy pandas yfinance pandas_datareader numerapi lxml
+          pip install numpy pandas yfinance pandas_datareader numerapi lxml beautifulsoup4
 
       - name: Execute Macro-Systemic Engine
         env:

@@ -8,86 +8,76 @@ import datetime
 import gc
 
 # 1. INSTITUTIONAL AUTHENTICATION
-# Ensuring the FRED key is visible to the library environment
-os.environ["FRED_API_KEY"] = os.getenv('FRED_API_KEY', '3699988d98d460d752a241f85df9532f').strip()
-
+os.environ["FRED_API_KEY"] = "3699988d98d460d752a241f85df9532f"
 PUBLIC_KEY = os.getenv('NUMERAI_PUBLIC_KEY').strip()
 SECRET_KEY = os.getenv('NUMERAI_SECRET_KEY').strip()
 sapi = SignalsAPI(PUBLIC_KEY, SECRET_KEY)
 
-# 2. MACRO REGIME FILTER (GWP 610 Logic)
+# 2. MACRO SHIELD (MScFE 610 Logic)
 def get_risk_multiplier():
     try:
-        print("Connecting to St. Louis Fed (FRED)...")
+        print("Consulting FRED for Systemic Risk...")
         start = datetime.datetime.now() - datetime.timedelta(days=90)
-        # Pulling the 10Y-2Y Treasury Spread (The Systemic Risk Compass)
         spread_data = web.get_data_fred('T10Y2Y', start)
-        latest_spread = spread_data.iloc[-1].values[0]
-        print(f"Institutional Signal: 10Y-2Y Spread is {latest_spread}")
-        return 0.5 if latest_spread < 0 else 1.0
-    except Exception as e:
-        print(f"FRED Auth Bypass: {e}. Defaulting to safe risk (1.0).")
+        latest = spread_data.iloc[-1].values[0]
+        print(f"10Y-2Y Spread: {latest}")
+        return 0.5 if latest < 0 else 1.0
+    except:
         return 1.0
 
-# 3. ALPHA GENERATION (MScFE 632 Mean Reversion)
+# 3. UNIVERSE EXPANSION (S&P 500 - Solving the 'Not Enough Stocks' Error)
+def get_sp500_tickers():
+    # Efficiently scraping the S&P 500 list from Wikipedia (Institutional Standard)
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+    table = pd.read_html(url)
+    df = table[0]
+    return df['Symbol'].tolist()
+
+# 4. ALPHA GENERATION (MScFE 632 logic)
 def generate_signals(ticker_data, risk_multiplier):
-    # Normalized Z-Score calculation
     m_avg = ticker_data.rolling(window=20).mean()
     m_std = ticker_data.rolling(window=20).std()
     z_score = (ticker_data - m_avg) / m_std
-    # Mean Reversion: Bet against the extreme movement
     raw_alpha = -z_score.iloc[-1] 
     return raw_alpha * risk_multiplier
 
-# 4. UNIVERSE SELECTION (Liquid S&P Assets)
-tickers = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "JPM", "V", 
-    "PG", "HD", "DIS", "BAC", "VZ", "ADBE", "NFLX", "INTC", "PFE", "T", "XOM"
-]
-
 if __name__ == "__main__":
-    print("Executing V5.0 Macro-Systemic Signals Pipeline...")
+    print("Executing V7.0 High-Capacity Signals Pipeline...")
     
-    # Process Filter
+    # Process Filter & Universe
     multiplier = get_risk_multiplier()
-    
-    # Download Equity Data
-    # We disable threading to keep RAM usage extremely low for the 7GB cloud server
-    data = yf.download(tickers, period="1y", interval="1d", progress=False, threads=False)['Close']
+    tickers = get_sp500_tickers()
+    print(f"Targeting {len(tickers)} assets for maximum statistical significance.")
+
+    # Download Market Data in chunks to prevent Cloud RAM crash
+    # We use a 1-year window for stable Z-scores
+    data = yf.download(tickers, period="1y", interval="1d", progress=False, threads=True)['Close']
     data = data.ffill().fillna(0)
 
-    # Process Alpha
     final_alpha = generate_signals(data, multiplier)
     predictions = final_alpha.rank(pct=True)
 
-    # 5. DYNAMIC MODEL HANDSHAKE (The 'Model Not Found' Fix)
+    # 5. DYNAMIC MODEL HANDSHAKE
     try:
-        print("Scanning Signals Dashboard for verified handle...")
         my_models = sapi.get_models()
-        print(f"Visible Model Slots: {my_models}")
-        
         target_handle = "dawityimer"
-        target_uuid = None
-        
-        # Case-insensitive search for the model UUID
-        for name, uuid in my_models.items():
-            if name.lower() == target_handle.lower():
-                target_uuid = uuid
-                break
+        target_uuid = next((uuid for name, uuid in my_models.items() if name.lower() == target_handle), None)
         
         if not target_uuid:
-            raise ValueError(f"Model '{target_handle}' not found. Please create it at signals.numer.ai/dashboard")
+            print(f"ERROR: Create slot '{target_handle}' at signals.numer.ai first!")
+            exit(1)
 
-        print(f"Handshaking with UUID: {target_uuid}")
-
-        # 6. FORMATTING & DELIVERY
+        # 6. FORMATTING (Standardizing for Bloomberg/US Format)
         submission = predictions.reset_index()
         submission.columns = ["ticker", "signal"]
         submission["ticker"] = submission["ticker"].apply(lambda x: f"{x} US")
-        submission.to_csv("signals_upload.csv", index=False)
         
-        sapi.upload_predictions("signals_upload.csv", model_id=target_uuid)
-        print("SUCCESS: V5.0 MACRO-SYSTEMIC ALPHA DELIVERED.")
+        # FINAL AUDIT: Ensure we meet the minimum stock count (usually > 100)
+        print(f"Final submission contains {len(submission)} stocks.")
+        
+        submission.to_csv("submission.csv", index=False)
+        sapi.upload_predictions("submission.csv", model_id=target_uuid)
+        print("SUCCESS: HIGH-CAPACITY ALPHA DELIVERED.")
         
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")

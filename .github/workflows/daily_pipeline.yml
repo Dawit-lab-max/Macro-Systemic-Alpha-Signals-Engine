@@ -20,10 +20,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Quant Stack
+      - name: Install Pinned Quant Stack
         run: |
           pip install --upgrade pip
-          pip install numpy pandas yfinance pandas_datareader numerapi lxml beautifulsoup4
+          # Pinned versions to fix the 'deprecate_kwarg' bug
+          pip install pandas==2.1.4 pandas-datareader==0.10.0
+          pip install numpy yfinance numerapi lxml beautifulsoup4
 
       - name: Execute Macro-Systemic Engine
         env:

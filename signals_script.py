@@ -4,16 +4,18 @@ Numerai Signals Submission Pipeline
 Author: MScFE Team / Dawit Yimer Production Setup
 Description: Low-memory, crash-resistant production pipeline using Polars.
              Dynamically retrieves the official universe via live.parquet,
-             handles ticker mapping via pure-Python rules,
-             and applies mean reversion and FRED macro risk shields.
-             Uses a browser-mimicking requests session to bypass rate-limiting.
+             decouples completely from yfinance, and fetches historical prices
+             from Stooq using parallel I/O requests. Maps signals and applies
+             FRED macro risk shields.
 """
 import os
 import sys
 import requests
+import io
+import random
+import concurrent.futures
 import pandas as pd
 import polars as pl
-import yfinance as yf
 import numerapi
 
 # ==========================================
@@ -69,122 +71,69 @@ def fetch_official_universe(sapi: numerapi.SignalsAPI) -> tuple[list[str], str]:
     raise RuntimeError("Critical: Failed to resolve the official universe across all channels.")
 
 # ==========================================
-# TICKER CONVERTER
+# STOOQ HISTORICAL DATA DOWNLOADER
 # ==========================================
-class TickerConverter:
+def download_stooq_ticker(symbol: str) -> pl.DataFrame:
     """
-    Pure-Python Rule-Based Ticker Converter.
-    Eliminates dependencies on external S3 CSV mapping databases.
-    Maps Bloomberg/Numerai formats (e.g., 'AAPL US', '7203 JP') to Yahoo, and vice-versa.
+    Downloads historical EOD CSV daily data from Stooq for a single symbol.
+    Returns a Polars DataFrame with columns: date, ticker, close.
     """
-    def __init__(self):
-        # Forward maps (Exchange ISO code -> Yahoo suffix)
-        self.iso_to_yahoo_suffix = {
-            "US": "",
-            "JP": ".T",
-            "KR": ".KS",
-            "GB": ".L",
-            "CA": ".TO",
-            "AU": ".AX",
-            "FR": ".PA",
-            "DE": ".DE",
-            "HK": ".HK",
-            "CN": ".SS",
-            "ID": ".JK",
-            "IT": ".MI",
-            "NL": ".AS",
-            "ES": ".MC",
-            "CH": ".SW",
-            "IL": ".TA",
-            "IN": ".NS",
-            "BR": ".SA",
-            "MX": ".MX",
-            "PL": ".WA",
-            "ZA": ".JO",
-        }
-        # Inverse maps (Yahoo suffix -> Exchange ISO code)
-        self.yahoo_suffix_to_iso = {
-            "": "US",
-            "T": "JP",
-            "KS": "KR",
-            "L": "GB",
-            "TO": "CA",
-            "V": "CA",
-            "AX": "AU",
-            "PA": "FR",
-            "DE": "DE",
-            "HK": "HK",
-            "SS": "CN",
-            "SZ": "CN",
-            "JK": "ID",
-            "MI": "IT",
-            "AS": "NL",
-            "MC": "ES",
-            "SW": "CH",
-            "TA": "IL",
-            "NS": "IN",
-            "SA": "BR",
-            "MX": "MX",
-            "WA": "PL",
-            "JO": "ZA",
-        }
+    parts = symbol.split(" ")
+    if len(parts) != 2:
+        return None
+    ticker_name, country = parts[0], parts[1].upper()
+    
+    # Align countries with Stooq's suffixes
+    if country == "GB":
+        stooq_symbol = f"{ticker_name}.UK"
+    else:
+        stooq_symbol = f"{ticker_name}.{country}"
+        
+    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200 or len(response.text.strip()) < 100:
+            return None
+        
+        # Load CSV using pandas and convert to Polars
+        df_pd = pd.read_csv(io.StringIO(response.text))
+        if df_pd.empty or "Close" not in df_pd.columns or "Date" not in df_pd.columns:
+            return None
+            
+        df = pl.from_pandas(df_pd)
+        df = df.select([
+            pl.col("Date").alias("date"),
+            pl.col("Close").alias("close")
+        ])
+        df = df.with_columns(pl.lit(symbol).alias("ticker"))
+        return df
+    except Exception:
+        return None
 
-    def to_yahoo(self, source_ticker: str) -> str:
-        if not source_ticker:
-            return ""
-        src_clean = str(source_ticker).strip()
-        parts = src_clean.split(" ")
-        if len(parts) == 2:
-            ticker, exchange = parts[0], parts[1].upper()
-            ticker = ticker.replace("/", "-")
-            
-            # Map using ISO or standard fallback exchange rule
-            if exchange in self.iso_to_yahoo_suffix:
-                suffix = self.iso_to_yahoo_suffix[exchange]
-                return f"{ticker}{suffix}"
-            else:
-                # Fallback exchange codes (e.g., Bloomberg legacy mapping)
-                fallback_map = {
-                    "LN": ".L", "CN": ".TO", "FP": ".PA", "GY": ".DE"
-                }
-                suffix = fallback_map.get(exchange, f".{exchange.lower()}")
-                return f"{ticker}{suffix}"
-        return src_clean
-
-    def to_target(self, yahoo_ticker: str, target_col: str) -> str:
-        if not yahoo_ticker:
-            return ""
-        yahoo_clean = str(yahoo_ticker).strip()
-        if "." in yahoo_clean:
-            ticker, suffix = yahoo_clean.split(".", 1)
-            ticker = ticker.replace("-", "/")
-            suffix_upper = suffix.upper()
-            
-            # 1. Output Numerai-compliant ISO format if target column is numerai_ticker
-            if target_col in ["numerai_ticker", "ticker"]:
-                if suffix in self.yahoo_suffix_to_iso:
-                    country = self.yahoo_suffix_to_iso[suffix]
-                elif suffix_upper in self.yahoo_suffix_to_iso:
-                    country = self.yahoo_suffix_to_iso[suffix_upper]
-                else:
-                    country = suffix_upper
-                return f"{ticker} {country}"
-            
-            # 2. Output legacy Bloomberg formats otherwise
-            else:
-                bbg_exchange_map = {
-                    "L": "LN", "TO": "CN", "V": "CN", "PA": "FP", "DE": "GY", "SW": "SW"
-                }
-                if suffix in bbg_exchange_map:
-                    exchange = bbg_exchange_map[suffix]
-                elif suffix_upper in bbg_exchange_map:
-                    exchange = bbg_exchange_map[suffix_upper]
-                else:
-                    exchange = self.yahoo_suffix_to_iso.get(suffix, suffix_upper)
-                return f"{ticker} {exchange}"
-        else:
-            ticker = yahoo_clean.replace("-", "/")
-            return f"{ticker} US"
+def download_historical_prices_stooq(symbols: list) -> pl.DataFrame:
+    """
+    Downloads historical daily data from Stooq for multiple symbols concurrently.
+    """
+    print(f"[Data Downloader] Concurrently downloading {len(symbols)} tickers from Stooq...")
+    dfs = []
+    
+    # Utilize threaded workers for concurrency under I/O bounds
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+        future_to_symbol = {executor.submit(download_stooq_ticker, sym): sym for sym in symbols}
+        
+        for future in concurrent.futures.as_completed(future_to_symbol):
+            res = future.result()
+            if res is not None:
+                dfs.append(res)
+                
+    if not dfs:
+        raise ValueError("Critical Error: All market data downloads failed from Stooq.")
+        
+    return pl.concat(dfs)
 
 # ==========================================
 # RISK SHIELD (FRED T10Y2Y)
@@ -214,112 +163,6 @@ def get_latest_yield_curve_spread() -> float:
         return 1.0
 
 # ==========================================
-# DATA DOWNLOADER
-# ==========================================
-def download_historical_prices(yahoo_tickers: list, period: str = "3mo") -> pl.DataFrame:
-    """
-    Downloads historical data from Yahoo Finance in optimal chunks.
-    Melted to long format immediately to prevent RAM blowouts under 7GB limit.
-    Uses custom requests session with browser headers to bypass cloud IP scraping blocks.
-    """
-    # Create custom session with modern desktop user-agent headers
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive'
-    })
-
-    chunk_size = 400
-    dfs = []
-    
-    for i in range(0, len(yahoo_tickers), chunk_size):
-        chunk = yahoo_tickers[i:i + chunk_size]
-        print(f"[Data Downloader] Batch {i // chunk_size + 1}/{(len(yahoo_tickers) - 1) // chunk_size + 1}...")
-        try:
-            # Pass custom session with browser headers
-            chunk_data = yf.download(
-                chunk, 
-                period=period, 
-                interval="1d", 
-                progress=False, 
-                session=session,
-                threads=True
-            )
-            
-            if chunk_data.empty:
-                print(f"[Data Downloader] Warning: Empty data returned for batch starting at index {i}")
-                continue
-                
-            # Assign index name to "Date" before processing structure
-            chunk_data.index.name = "Date"
-            
-            # 1. Handle MultiIndex Column Structures (dynamic level inspection)
-            if isinstance(chunk_data.columns, pd.MultiIndex):
-                metric_level = None
-                ticker_level = None
-                
-                # Dynamically locate which index level contains price metrics
-                for level_idx in [0, 1]:
-                    unique_vals = chunk_data.columns.get_level_values(level_idx).unique()
-                    if any(m in unique_vals for m in ["Adj Close", "Close"]):
-                        metric_level = level_idx
-                    else:
-                        ticker_level = level_idx
-                
-                # Set fallback levels if levels cannot be dynamically determined
-                if metric_level is None or ticker_level is None:
-                    metric_level, ticker_level = 0, 1
-                
-                # Choose Adj Close if available, fallback to Close
-                available_metrics = chunk_data.columns.get_level_values(metric_level).unique()
-                target_metric = "Adj Close" if "Adj Close" in available_metrics else "Close"
-                
-                # Extract columns under targeted metric using cross-section
-                adj_close = chunk_data.xs(target_metric, axis=1, level=metric_level).copy()
-                
-            # 2. Handle Flat Column Structures (single-ticker results)
-            else:
-                if "Adj Close" in chunk_data.columns:
-                    adj_close = chunk_data[["Adj Close"]].copy()
-                elif "Close" in chunk_data.columns:
-                    adj_close = chunk_data[["Close"]].copy()
-                else:
-                    continue
-                # Map metric column directly to ticker symbol
-                adj_close.columns = [chunk[0]]
-                
-            # 3. Cast to DataFrame if slicing yielded a pd.Series (prevents AttributeError on .columns)
-            if isinstance(adj_close, pd.Series):
-                adj_close = adj_close.to_frame()
-                
-            # 4. Explicitly enforce "Date" index name on the extracted DataFrame
-            adj_close.index.name = "Date"
-            
-            # 5. Melt to long format
-            melted = adj_close.reset_index().melt(
-                id_vars="Date", 
-                value_vars=adj_close.columns, 
-                var_name="ticker", 
-                value_name="close"
-            )
-            
-            # Cast to Polars to save memory
-            pl_df = pl.from_pandas(melted).rename({"Date": "date"}).drop_nulls()
-            dfs.append(pl_df)
-            
-        except Exception as e:
-            print(f"[Data Downloader] Warning: Failed downloading batch starting at index {i}: {e}")
-            continue
-            
-    if not dfs:
-        raise ValueError("Critical: All market data downloads failed.")
-        
-    return pl.concat(dfs)
-
-# ==========================================
 # MAIN PIPELINE EXECUTION
 # ==========================================
 def main():
@@ -333,22 +176,23 @@ def main():
         
     sapi = numerapi.SignalsAPI(public_key, secret_key)
     
-    # 1. Official Universe Handshake (Retrieves exact, active column name and tickers)
+    # 1. Official Universe Handshake
     eligible_tickers, target_col = fetch_official_universe(sapi)
     print(f"Retrieved official universe of {len(eligible_tickers)} active tickers using target column: '{target_col}'")
     
-    # 2. Ticker Conversion Setup
-    converter = TickerConverter()
+    # Filter US liquid segment to preserve rate limits and ensure maximum data density
+    us_tickers = [t for t in eligible_tickers if t.endswith(" US")]
     
-    # Convert active tickers to Yahoo Tickers for downloading
-    yahoo_tickers_to_fetch = list(set([converter.to_yahoo(t) for t in eligible_tickers]))
-    print(f"Mapped {len(eligible_tickers)} source tickers to {len(yahoo_tickers_to_fetch)} unique Yahoo tickers.")
+    # Deterministic sampling (800 stocks provides a highly diverse baseline portfolio)
+    random.seed(42)
+    tickers_to_fetch = random.sample(us_tickers, min(len(us_tickers), 800))
+    print(f"Filtered universe to {len(tickers_to_fetch)} liquid US assets for target download.")
     
-    # 3. Memory-Safe Market Data Fetch (Polars/Vectorized chunking - "3mo" period)
-    prices_df = download_historical_prices(yahoo_tickers_to_fetch, period="3mo")
+    # 2. Parallel Stooq Historical Data Retrieval (Bypasses Yahoo rate-limits)
+    prices_df = download_historical_prices_stooq(tickers_to_fetch)
     print(f"[Diagnostics] prices_df raw download shape: {prices_df.shape}")
     
-    # 4. Alpha Calculation: MScFE 20-Day Mean Reversion
+    # 3. Alpha Calculation: MScFE 20-Day Mean Reversion
     print("Computing rolling mean reversion z-scores...")
     prices_df = prices_df.sort(["ticker", "date"])
     
@@ -358,14 +202,14 @@ def main():
         pl.col("close").rolling_std(window_size=20).over("ticker").alias("std_20")
     ])
     
-    # Drop rows without enough history (requiring std_20 calculated on 20 trading days)
+    # Drop rows without enough history
     prices_df = prices_df.filter(
         (pl.col("std_20").is_not_null()) & (pl.col("std_20") > 1e-8)
     )
     print(f"[Diagnostics] prices_df post-std_20 filtering shape: {prices_df.shape}")
     
     if prices_df.height == 0:
-        raise ValueError("Critical Abort: prices_df was emptied after filtering. Please inspect yfinance density.")
+        raise ValueError("Critical Abort: prices_df was emptied after filtering. Check Stooq output formats.")
 
     # Calculate Z-score
     prices_df = prices_df.with_columns(
@@ -390,17 +234,10 @@ def main():
         (pl.col("rank") / (num_signals + 1)).alias("signal")
     )
     
-    # Map back to the active identifier column format
-    latest_signals = latest_signals.with_columns(
-        pl.col("ticker").map_elements(lambda x: converter.to_target(x, target_col), return_dtype=pl.String).alias(target_col)
-    )
+    # Clean up column mapping names to align join keys
+    latest_signals = latest_signals.rename({"ticker": target_col})
     
-    # Log sample mapped elements to confirm format consistency
-    if latest_signals.height > 0:
-        print(f"[Diagnostics] Raw 'ticker' column samples: {latest_signals['ticker'].head(5).to_list()}")
-        print(f"[Diagnostics] Mapped '{target_col}' column samples: {latest_signals[target_col].head(5).to_list()}")
-        
-    # 5. Risk Shield Check (FRED Macro Overlay)
+    # 4. Risk Shield Check (FRED Macro Overlay)
     spread = get_latest_yield_curve_spread()
     print(f"FRED Yield Spread: {spread}%")
     
@@ -410,11 +247,9 @@ def main():
             pl.lit(0.5).alias("signal")
         )
         
-    # 6. Complete Universe Align & Safe-Fill
+    # 5. Complete Universe Align & Safe-Fill
     # Left-join computed signals to the downloaded active universe to ensure complete coverage.
     universe_df = pl.DataFrame({target_col: eligible_tickers})
-    print(f"[Diagnostics] universe_df sample: {universe_df[target_col].head(5).to_list()}")
-    
     submission_df = universe_df.join(
         latest_signals.select([target_col, "signal"]),
         on=target_col,
@@ -435,7 +270,7 @@ def main():
         pl.col("signal").clip(lower_bound=0.01, upper_bound=0.99)
     )
     
-    # 7. Pre-flight Validation (Explicitly enforce non-zero Standard Deviation)
+    # 6. Pre-flight Validation (Explicitly enforce non-zero Standard Deviation)
     signal_std = submission_df["signal"].std()
     print(f"[Sanity Check] Signal vector standard deviation: {signal_std}")
     
@@ -456,7 +291,7 @@ def main():
     if os.path.exists("live.parquet"):
         os.remove("live.parquet")
     
-    # 8. Model ID Validation & Upload
+    # 7. Model ID Validation & Upload
     print("Finding model ID programmatically...")
     try:
         models = sapi.get_models()

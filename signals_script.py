@@ -47,32 +47,38 @@ def main():
     sapi = numerapi.SignalsAPI(public_key, secret_key)
     conv = TickerConverter()
 
-    # 1. UNIVERSE HANDSHAKE
-    print("Handshaking with Numerai Universe...")
-    sapi.download_dataset("live.parquet", "live.parquet")
+    # 1. UNIVERSE HANDSHAKE (FIXED VERSIONED PATH)
+    # We try v1.0 which is the most stable path for Signals
+    dataset_path = "signals/v1.0/live.parquet"
+    print(f"Downloading Numerai Universe from {dataset_path}...")
+    
+    try:
+        sapi.download_dataset(dataset_path, "live.parquet")
+    except Exception as e:
+        print(f"Primary path failed, trying fallback... {e}")
+        sapi.download_dataset("live.parquet", "live.parquet") # API sometimes handles this differently
+
     universe = pl.read_parquet("live.parquet")
     possible_names = ["numerai_ticker", "bloomberg_ticker", "ticker"]
     ticker_col = next((c for c in possible_names if c in universe.columns), "ticker")
     all_tickers = universe[ticker_col].unique().to_list()
     
-    # 2. TARGETED DATA FETCH (150 tickers for speed/stability)
+    # 2. TARGETED DATA FETCH (150 tickers for speed and reliability)
     us_universe = [t for t in all_tickers if t is not None and t.endswith(" US")][:150]
     yahoo_list = [conv.to_yahoo(t) for t in us_universe]
 
-    print(f"Downloading market data for {len(yahoo_list)} tickers...")
+    print(f"Fetching market data for {len(yahoo_list)} stocks...")
     raw_data = yf.download(yahoo_list, period="7mo", interval="1d", threads=False, progress=False)
     
-    # Check for empty data
     if raw_data.empty or 'Adj Close' not in raw_data:
-        print("Yahoo Data Empty. Emergency Neutralization required.")
+        print("Market data fetch failed. Using neutral baseline.")
         latest = pl.DataFrame({ticker_col: [], "signal": []})
     else:
-        # Process data with Polars
         prices_pd = raw_data['Adj Close'].stack().reset_index()
         prices_pd.columns = ['date', 'yahoo_ticker', 'close']
         df = pl.from_pandas(prices_pd).sort(["yahoo_ticker", "date"]).drop_nulls()
 
-        # 3. ALPHA: Institutional Risk-Adjusted Reversion
+        # 3. ALPHA ENGINE
         df = df.with_columns([
             pl.col("close").rolling_mean(20).over("yahoo_ticker").alias("ma20"),
             pl.col("close").rolling_std(20).over("yahoo_ticker").alias("std20"),
@@ -85,26 +91,20 @@ def main():
 
         latest = df.group_by("yahoo_ticker").last().drop_nulls()
         latest = latest.with_columns((pl.col("raw_signal").rank() / (latest.height + 1)).alias("signal"))
-        
-        # Map back to Numerai format
         latest = latest.with_columns(
             pl.col("yahoo_ticker").map_elements(lambda x: conv.to_numerai(x, ticker_col), return_dtype=pl.String).alias(ticker_col)
         )
 
-    # 4. MACRO SHIELD & NEUTRALIZATION
+    # 4. MACRO SHIELD
     if get_yield_shield() < 0:
-        print("Yield Inversion! Activating Macro Shield.")
+        print("Yield Inversion! Protecting capital.")
         latest = latest.with_columns(pl.lit(0.5).alias("signal"))
 
-    # 5. FINAL ASSEMBLY (The "Non-Zero Std Dev" fix)
+    # 5. FINAL ASSEMBLY & EPSILON JITTER (Fixes non-zero std dev error)
     final_sub = universe.select(ticker_col).join(latest.select([ticker_col, "signal"]), on=ticker_col, how="left")
-    
-    # Fill missing with 0.5
     final_sub = final_sub.with_columns(pl.col("signal").fill_null(0.5))
 
-    # --- THE CRITICAL FIX: ADD EPSILON JITTER ---
-    # We add a tiny random noise (1e-6) so standard deviation is never zero.
-    # This keeps the model neutral but satisfies the server requirements.
+    # Add tiny random noise so the standard deviation is never exactly zero
     noise = np.random.uniform(-1e-6, 1e-6, len(final_sub))
     final_sub = final_sub.with_columns(
         (pl.col("signal") + pl.Series(noise)).clip(0.01, 0.99).alias("signal")
@@ -112,13 +112,12 @@ def main():
 
     # 6. UPLOAD
     final_sub.to_pandas().to_csv("submission.csv", index=False)
-    
     models = sapi.get_models()
     model_id = models.get(MODEL_SLOT_NAME) or next(iter(models.values()))
     
-    print(f"Uploading to {MODEL_SLOT_NAME} ({model_id})...")
+    print(f"Deploying to Numerai: {MODEL_SLOT_NAME}")
     sapi.upload_predictions("submission.csv", model_id=model_id)
-    print("SIGNALS ENGINE: MISSION SUCCESS.")
+    print("ET-QUANT SIGNALS ENGINE: DEPLOYMENT SUCCESS.")
 
 if __name__ == "__main__":
     main()

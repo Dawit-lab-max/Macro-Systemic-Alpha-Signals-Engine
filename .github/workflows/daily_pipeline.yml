@@ -1,16 +1,20 @@
-name: Daily_Signals_Automation
+name: Institutional_Daily_Automation_Signals
 
 on:
   schedule:
+    # Runs at 19:00 UTC (22:00 EAT / Addis Time)
+    # This is the ideal time for Signals data availability.
     - cron: '0 19 * * *' 
   workflow_dispatch: 
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 jobs:
-  run_signals:
+  run_alpha_engine:
     runs-on: ubuntu-latest
+    
+    concurrency:
+      group: signals-submission
+      cancel-in-progress: true
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -20,15 +24,18 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Pinned Quant Stack
+      - name: Install Quant Stack
         run: |
           pip install --upgrade pip
-          # Institutional Stability: Version Pinning
-          pip install pandas==2.1.4 pandas-datareader==0.10.0 numpy==1.26.4 polars==1.0.0
-          pip install yfinance numerapi lxml beautifulsoup4 requests
+          pip install numpy pandas scipy numerapi polars lightgbm yfinance pyarrow requests
 
+      # Executes the Signals Alpha Factory
       - name: Execute Macro-Systemic Engine
         env:
           NUMERAI_PUBLIC_KEY: ${{ secrets.NUMERAI_PUBLIC_KEY }}
           NUMERAI_SECRET_KEY: ${{ secrets.NUMERAI_SECRET_KEY }}
         run: python signals_script.py
+
+      - name: Production Status
+        if: success()
+        run: echo "SIGNALS ALPHA DEPLOYED."
